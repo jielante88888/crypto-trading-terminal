@@ -1,731 +1,744 @@
 """
 持仓管理和追踪系统
-负责管理所有交易持仓的状态、风险和操作
+提供统一的持仓管理功能，支持实时监控、历史追踪和风险管理
 """
 
 import asyncio
-import json
-import uuid
+import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Callable, Any, Tuple
-from dataclasses import dataclass, field, asdict
+from decimal import Decimal
+from typing import List, Dict, Any, Optional, Union, Tuple
 from enum import Enum
-from collections import defaultdict, deque
-import decimal
+import json
 
-import structlog
-import numpy as np
-
-from ..adapters.base import Position, Order, MarketData
-from ..utils.exceptions import PositionManagerError
-
-logger = structlog.get_logger(__name__)
+from ..storage.models.account_models import (
+    Position,
+    PositionType,
+    Account,
+    PnLRecord,
+    PnLType,
+    account_manager,
+)
+from .pnl_calculator import RealTimePnLCalculator, PnLCalculationMode
+from .account_sync_manager import AccountBalanceSyncManager
+from ..core.exceptions import ValidationException, ManagementException
 
 
 class PositionStatus(Enum):
     """持仓状态"""
+
     OPEN = "open"
     CLOSED = "closed"
+    PARTIAL = "partial"
     PENDING = "pending"
-    LIQUIDATED = "liquidated"
-    HEDGED = "hedged"
+    CANCELLED = "cancelled"
 
 
 class PositionAction(Enum):
-    """持仓操作"""
-    OPEN = "open"
-    CLOSE = "close"
-    ADD = "add"
-    REDUCE = "reduce"
-    HEDGE = "hedge"
-    ADJUST = "adjust"
+    """持仓操作类型"""
+
+    OPEN_POSITION = "open_position"
+    CLOSE_POSITION = "close_position"
+    ADD_POSITION = "add_position"
+    REDUCE_POSITION = "reduce_position"
+    CHANGE_LEVERAGE = "change_leverage"
+    UPDATE_STOP_LOSS = "update_stop_loss"
+    UPDATE_TAKE_PROFIT = "update_take_profit"
 
 
 class PositionAlertType(Enum):
     """持仓预警类型"""
+
+    LIQUIDATION_RISK = "liquidation_risk"
     PROFIT_TARGET = "profit_target"
     STOP_LOSS = "stop_loss"
-    RISK_WARNING = "risk_warning"
     MARGIN_CALL = "margin_call"
-    LIQUIDATION_RISK = "liquidation_risk"
-    POSITION_SIZE = "position_size"
+    PRICE_ALERT = "price_alert"
 
 
-@dataclass
 class PositionAlert:
     """持仓预警"""
-    id: str
-    type: PositionAlertType
-    message: str
-    severity: str  # info, warning, error, critical
-    position_id: str
-    data: Dict[str, Any] = field(default_factory=dict)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    acknowledged: bool = False
 
+    def __init__(
+        self,
+        position_id: str,
+        alert_type: PositionAlertType,
+        message: str,
+        severity: str = "medium",  # low, medium, high, critical
+        triggered_at: Optional[datetime] = None,
+    ):
+        self.id = f"{position_id}_{alert_type.value}_{int(datetime.now().timestamp())}"
+        self.position_id = position_id
+        self.alert_type = alert_type
+        self.message = message
+        self.severity = severity
+        self.triggered_at = triggered_at or datetime.now()
+        self.acknowledged = False
 
-@dataclass
-class PositionSnapshot:
-    """持仓快照"""
-    position_id: str
-    symbol: str
-    side: str
-    size: float
-    entry_price: float
-    current_price: float
-    unrealized_pnl: float
-    margin_used: float
-    leverage: float
-    timestamp: datetime
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "position_id": self.position_id,
+            "alert_type": self.alert_type.value,
+            "message": self.message,
+            "severity": self.severity,
+            "triggered_at": self.triggered_at.isoformat(),
+            "acknowledged": self.acknowledged,
+        }
 
 
 class PositionTrackingService:
     """持仓追踪服务"""
 
     def __init__(self):
-        # 持仓存储
-        self.positions: Dict[str, Position] = {}
-        self.position_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
-        
-        # 预警系统
-        self.alerts: List[PositionAlert] = []
-        self.alert_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
-        self.alert_callbacks: List[Callable] = []
-        
-        # 监控任务
-        self._tracking_task: Optional[asyncio.Task] = None
-        self._is_running = False
-        
-        # 风险参数
-        self.max_position_size = 10000.0
-        self.max_daily_loss = 1000.0
-        self.default_stop_loss = 0.02  # 2%
-        self.default_take_profit = 0.04  # 4%
-        
-        # 价格缓存
-        self.price_cache: Dict[str, float] = {}
-        self.price_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
-        
-        logger.info("持仓追踪服务初始化完成")
+        self.active_positions: Dict[str, Position] = {}
+        self.position_history: Dict[str, List[Dict[str, Any]]] = {}
+        self.position_alerts: Dict[str, List[PositionAlert]] = {}
+        self.pnl_calculator = RealTimePnLCalculator()
+        self.sync_manager = AccountBalanceSyncManager()
 
-    async def start_tracking(self):
-        """启动持仓追踪"""
-        if self._is_running:
-            return
-            
-        self._is_running = True
-        self._tracking_task = asyncio.create_task(self._tracking_loop())
-        
-        logger.info("持仓追踪服务已启动")
+        self.logger = logging.getLogger(__name__)
 
-    async def stop_tracking(self):
-        """停止持仓追踪"""
-        self._is_running = False
-        
-        if self._tracking_task:
-            self._tracking_task.cancel()
-            try:
-                await self._tracking_task
-            except asyncio.CancelledError:
-                pass
-                
-        logger.info("持仓追踪服务已停止")
+        # 追踪配置
+        self.alert_thresholds = {
+            "liquidation_distance_pct": Decimal("10"),  # 10%强平距离预警
+            "profit_target_pct": Decimal("5"),  # 5%盈利目标
+            "stop_loss_pct": Decimal("3"),  # 3%止损
+            "margin_level_warning": Decimal("1.5"),  # 150%保证金水平预警
+        }
 
-    async def _tracking_loop(self):
-        """追踪循环"""
-        while self._is_running:
-            try:
-                await self._update_positions()
-                await self._check_alerts()
-                await self._cleanup_old_data()
-                await asyncio.sleep(1)  # 每秒更新一次
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"追踪循环异常: {e}")
-                await asyncio.sleep(5)
-
-    async def _update_positions(self):
-        """更新持仓状态"""
-        for position in list(self.positions.values()):
-            try:
-                await self._update_single_position(position)
-            except Exception as e:
-                logger.error(f"更新持仓失败 {position.id}: {e}")
-
-    async def _update_single_position(self, position: Position):
-        """更新单个持仓"""
+    async def start_tracking_position(
+        self, position: Position, alert_config: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """开始追踪持仓"""
         try:
-            # 获取当前价格
-            current_price = await self._get_current_price(position.symbol)
-            if current_price:
-                # 更新未实现盈亏
-                await self._update_pnl(position, current_price)
-                
-                # 检查是否需要触发预警
-                await self._check_position_alerts(position, current_price)
-                
+            # 添加到活跃持仓
+            self.active_positions[position.position_id] = position
+
+            # 初始化历史记录
+            if position.position_id not in self.position_history:
+                self.position_history[position.position_id] = []
+
+            # 添加初始记录
+            await self._add_position_snapshot(position, "position_opened")
+
+            # 设置预警
+            if alert_config:
+                await self._setup_position_alerts(position, alert_config)
+
+            self.logger.info(f"开始追踪持仓: {position.position_id} {position.symbol}")
+            return True
+
         except Exception as e:
-            logger.error(f"更新持仓状态失败 {position.id}: {e}")
+            self.logger.error(f"开始追踪持仓失败: {e}")
+            raise ManagementException(f"开始追踪持仓失败: {e}")
 
-    async def _update_pnl(self, position: Position, current_price: float):
-        """更新未实现盈亏"""
+    async def stop_tracking_position(
+        self, position_id: str, reason: str = "manual"
+    ) -> bool:
+        """停止追踪持仓"""
         try:
-            if position.side == "LONG":
-                pnl = (current_price - position.entry_price) * position.size
-            else:  # SHORT
-                pnl = (position.entry_price - current_price) * position.size
-                
-            position.unrealized_pnl = pnl
-            position.mark_price = current_price
-            position.updated_at = datetime.utcnow()
-            
-            # 记录快照
-            snapshot = PositionSnapshot(
-                position_id=position.id,
-                symbol=position.symbol,
-                side=position.side,
-                size=position.size,
-                entry_price=position.entry_price,
-                current_price=current_price,
-                unrealized_pnl=pnl,
-                margin_used=position.margin_used,
-                leverage=position.leverage,
-                timestamp=datetime.utcnow()
+            if position_id not in self.active_positions:
+                return False
+
+            position = self.active_positions[position_id]
+
+            # 添加最终记录
+            await self._add_position_snapshot(position, f"position_closed_{reason}")
+
+            # 从活跃持仓中移除
+            del self.active_positions[position_id]
+
+            # 清理预警
+            if position_id in self.position_alerts:
+                del self.position_alerts[position_id]
+
+            self.logger.info(f"停止追踪持仓: {position_id}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"停止追踪持仓失败: {e}")
+            raise ManagementException(f"停止追踪持仓失败: {e}")
+
+    async def get_position_status(self, position_id: str) -> Dict[str, Any]:
+        """获取持仓状态"""
+        try:
+            position = self.active_positions.get(position_id)
+            if not position:
+                return {"error": "持仓不存在或已关闭"}
+
+            # 计算实时盈亏
+            pnl_result = await self.pnl_calculator.calculate_position_pnl(
+                position, mode=PnLCalculationMode.COMPREHENSIVE
             )
-            
-            self.position_history[position.id].append(snapshot)
-            
-        except Exception as e:
-            logger.error(f"更新盈亏失败 {position.id}: {e}")
 
-    async def _check_position_alerts(self, position: Position, current_price: float):
-        """检查持仓预警"""
+            # 获取风险评估
+            risk_assessment = position.get_risk_assessment()
+
+            # 检查预警
+            alerts = await self._check_position_alerts(position)
+
+            return {
+                "position_id": position_id,
+                "status": PositionStatus.OPEN.value,
+                "symbol": position.symbol,
+                "quantity": float(position.quantity),
+                "side": position.side,
+                "entry_price": float(position.entry_price),
+                "current_price": float(position.current_price),
+                "unrealized_pnl": pnl_result["unrealized_pnl"],
+                "total_pnl": pnl_result["total_pnl"],
+                "pnl_percentage": pnl_result["pnl_percentage"],
+                "margin_level": risk_assessment["margin_level"],
+                "leverage_ratio": risk_assessment["leverage_ratio"],
+                "risk_level": risk_assessment["risk_level"],
+                "alerts": [alert.to_dict() for alert in alerts],
+                "opened_at": position.opened_at.isoformat(),
+                "last_updated": position.last_updated.isoformat(),
+                "tracking_duration": (
+                    datetime.now() - position.opened_at
+                ).total_seconds(),
+            }
+
+        except Exception as e:
+            self.logger.error(f"获取持仓状态失败: {e}")
+            return {"error": str(e)}
+
+    async def get_all_active_positions(self) -> List[Dict[str, Any]]:
+        """获取所有活跃持仓"""
         try:
-            # 检查止损
-            if position.stop_loss and current_price <= position.stop_loss:
-                await self._create_alert(
-                    position.id,
-                    PositionAlertType.STOP_LOSS,
-                    f"止损被触发: {position.symbol}",
-                    "warning",
-                    {
-                        "current_price": current_price,
-                        "stop_loss": position.stop_loss,
-                        "unrealized_pnl": position.unrealized_pnl
-                    }
-                )
-            
-            # 检查止盈
-            if position.take_profit and current_price >= position.take_profit:
-                await self._create_alert(
-                    position.id,
-                    PositionAlertType.PROFIT_TARGET,
-                    f"止盈被触发: {position.symbol}",
-                    "info",
-                    {
-                        "current_price": current_price,
-                        "take_profit": position.take_profit,
-                        "unrealized_pnl": position.unrealized_pnl
-                    }
-                )
-            
-            # 检查持仓大小
-            if abs(position.size) > self.max_position_size:
-                await self._create_alert(
-                    position.id,
-                    PositionAlertType.POSITION_SIZE,
-                    f"持仓大小超过限制: {position.symbol}",
-                    "warning",
-                    {
-                        "position_size": position.size,
-                        "max_size": self.max_position_size
-                    }
-                )
-            
-            # 检查风险预警
-            if position.leverage > 10:  # 高杠杆预警
-                await self._create_alert(
-                    position.id,
-                    PositionAlertType.RISK_WARNING,
-                    f"高杠杆风险: {position.symbol} ({position.leverage}x)",
-                    "warning",
-                    {
-                        "leverage": position.leverage,
-                        "margin_used": position.margin_used
-                    }
-                )
-                
+            active_positions = []
+
+            for position_id, position in self.active_positions.items():
+                status = await self.get_position_status(position_id)
+                if "error" not in status:
+                    active_positions.append(status)
+
+            return active_positions
+
         except Exception as e:
-            logger.error(f"检查持仓预警失败 {position.id}: {e}")
+            self.logger.error(f"获取活跃持仓列表失败: {e}")
+            return []
 
-    async def _check_alerts(self):
-        """检查所有预警"""
-        try:
-            # 检查未读预警
-            unread_alerts = [alert for alert in self.alerts if not alert.acknowledged]
-            
-            if unread_alerts:
-                await self._notify_alerts(unread_alerts)
-                
-        except Exception as e:
-            logger.error(f"检查预警失败: {e}")
-
-    async def _cleanup_old_data(self):
-        """清理旧数据"""
-        try:
-            cutoff_time = datetime.utcnow() - timedelta(hours=24)
-            
-            # 清理旧的预警
-            self.alerts = [alert for alert in self.alerts if alert.timestamp > cutoff_time]
-            
-            # 清理旧的价格历史
-            for symbol in list(self.price_history.keys()):
-                while (self.price_history[symbol] and 
-                       self.price_history[symbol][0].timestamp < cutoff_time):
-                    self.price_history[symbol].popleft()
-                    
-        except Exception as e:
-            logger.error(f"清理旧数据失败: {e}")
-
-    async def _get_current_price(self, symbol: str) -> Optional[float]:
-        """获取当前价格"""
-        return self.price_cache.get(symbol)
-
-    async def _create_alert(
+    async def get_position_history(
         self,
         position_id: str,
-        alert_type: PositionAlertType,
-        message: str,
-        severity: str,
-        data: Dict[str, Any]
-    ):
-        """创建预警"""
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """获取持仓历史记录"""
         try:
-            alert = PositionAlert(
-                id=str(uuid.uuid4()),
-                type=alert_type,
-                message=message,
-                severity=severity,
-                position_id=position_id,
-                data=data
-            )
-            
-            self.alerts.append(alert)
-            self.alert_history[position_id].append(alert)
-            
-            logger.info(f"创建预警: {message}", extra={"alert": asdict(alert)})
-            
+            history = self.position_history.get(position_id, [])
+
+            if start_time or end_time:
+                filtered_history = []
+                for record in history:
+                    record_time = datetime.fromisoformat(record["timestamp"])
+                    if start_time and record_time < start_time:
+                        continue
+                    if end_time and record_time > end_time:
+                        continue
+                    filtered_history.append(record)
+                history = filtered_history
+
+            return history
+
         except Exception as e:
-            logger.error(f"创建预警失败: {e}")
+            self.logger.error(f"获取持仓历史失败: {e}")
+            return []
 
-    async def _notify_alerts(self, alerts: List[PositionAlert]):
-        """通知预警"""
-        for callback in self.alert_callbacks:
-            try:
-                if asyncio.iscoroutinefunction(callback):
-                    await callback(alerts)
-                else:
-                    callback(alerts)
-            except Exception as e:
-                logger.error(f"预警回调执行失败: {e}")
-
-    # 公共API方法
-    
-    async def get_positions(self, status: Optional[PositionStatus] = None) -> List[Position]:
-        """获取持仓列表"""
-        positions = list(self.positions.values())
-        
-        if status:
-            positions = [p for p in positions if p.status == status]
-            
-        return positions
-
-    async def get_position(self, position_id: str) -> Optional[Position]:
-        """获取单个持仓"""
-        return self.positions.get(position_id)
-
-    async def update_position_price(self, symbol: str, price: float):
+    async def update_position_price(
+        self, position_id: str, new_price: Decimal, source: str = "manual"
+    ) -> bool:
         """更新持仓价格"""
-        self.price_cache[symbol] = price
-        self.price_history[symbol].append({
-            "price": price,
-            "timestamp": datetime.utcnow()
-        })
+        try:
+            if position_id not in self.active_positions:
+                raise ValidationException(f"持仓不存在: {position_id}")
+
+            position = self.active_positions[position_id]
+            old_price = position.current_price
+
+            # 更新价格
+            position.update_current_price(new_price)
+
+            # 添加价格更新记录
+            await self._add_position_snapshot(position, f"price_update_{source}")
+
+            # 检查是否触发预警
+            await self._check_and_trigger_alerts(position)
+
+            self.logger.debug(
+                f"更新持仓价格: {position_id} " f"{old_price} -> {new_price}"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"更新持仓价格失败: {e}")
+            return False
 
     async def close_position(
         self,
         position_id: str,
-        close_price: Optional[float] = None,
-        reason: str = "manual"
-    ) -> bool:
-        """平仓"""
+        close_price: Optional[Decimal] = None,
+        close_quantity: Optional[Decimal] = None,
+        reason: str = "manual",
+    ) -> Dict[str, Any]:
+        """平仓操作"""
         try:
-            position = self.positions.get(position_id)
-            if not position:
-                logger.warning(f"持仓不存在: {position_id}")
-                return False
-                
-            if close_price:
-                position.exit_price = close_price
-                await self._update_pnl(position, close_price)
-                
-            position.status = PositionStatus.CLOSED
-            position.closed_at = datetime.utcnow()
-            position.close_reason = reason
-            
-            # 创建预警
-            await self._create_alert(
-                position_id,
-                PositionAlertType.PROFIT_TARGET,
-                f"持仓已平仓: {position.symbol}",
-                "info",
-                {
-                    "exit_price": position.exit_price,
-                    "realized_pnl": position.realized_pnl,
-                    "reason": reason
-                }
+            if position_id not in self.active_positions:
+                raise ValidationException(f"持仓不存在: {position_id}")
+
+            position = self.active_positions[position_id]
+
+            # 获取平仓价格
+            if close_price is None:
+                close_price = position.current_price
+
+            # 计算平仓数量
+            quantity_to_close = close_quantity or abs(position.quantity)
+
+            # 执行平仓
+            close_result = position.close_position(close_price, quantity_to_close)
+
+            # 添加平仓记录
+            await self._add_position_snapshot(position, f"position_closed_{reason}")
+
+            # 创建盈亏记录
+            pnl_record = await account_manager.create_pnl_record(
+                account_id=position.account_id,
+                symbol=position.symbol,
+                pnl_type=PnLType.REALIZED,
+                pnl_amount=Decimal(str(close_result["realized_pnl"])),
+                period_start=position.opened_at,
+                period_end=datetime.now(),
+                position_id=position_id,
+                quantity=Decimal(str(close_result["close_quantity"])),
+                entry_price=position.entry_price,
+                exit_price=close_price,
+                commission=position.commission_paid,
             )
-            
-            logger.info(f"持仓已平仓: {position_id}")
-            return True
-            
+
+            # 如果完全平仓，停止追踪
+            if position.quantity == 0:
+                await self.stop_tracking_position(position_id, reason)
+
+            self.logger.info(
+                f"平仓成功: {position_id} 数量: {close_result['close_quantity']} 价格: {close_price}"
+            )
+
+            return {
+                "position_id": position_id,
+                "close_quantity": close_result["close_quantity"],
+                "close_price": float(close_price),
+                "realized_pnl": close_result["realized_pnl"],
+                "remaining_quantity": close_result["remaining_quantity"],
+                "pnl_record_id": pnl_record.record_id,
+                "closed_at": datetime.now().isoformat(),
+            }
+
         except Exception as e:
-            logger.error(f"平仓失败 {position_id}: {e}")
-            return False
+            self.logger.error(f"平仓失败: {e}")
+            raise ManagementException(f"平仓失败: {e}")
 
     async def add_position(
         self,
-        symbol: str,
-        side: str,
-        size: float,
-        entry_price: float,
-        leverage: float = 1.0,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        margin_used: float = 0.0,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """创建新持仓"""
+        position_id: str,
+        additional_quantity: Decimal,
+        additional_price: Decimal,
+        reason: str = "manual_addition",
+    ) -> Dict[str, Any]:
+        """加仓操作"""
         try:
-            position_id = str(uuid.uuid4())
-            
-            position = Position(
-                id=position_id,
-                symbol=symbol,
-                side=side,
-                size=size,
-                entry_price=entry_price,
-                leverage=leverage,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                margin_used=margin_used,
-                metadata=metadata or {},
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            
-            self.positions[position_id] = position
-            
-            # 创建预警
-            await self._create_alert(
-                position_id,
-                PositionAlertType.RISK_WARNING,
-                f"新持仓创建: {symbol}",
-                "info",
-                {
-                    "side": side,
-                    "size": size,
-                    "entry_price": entry_price,
-                    "leverage": leverage
-                }
-            )
-            
-            logger.info(f"新持仓创建: {position_id} - {symbol}")
-            return position_id
-            
-        except Exception as e:
-            logger.error(f"创建持仓失败: {e}")
-            raise PositionManagerError(f"创建持仓失败: {e}")
+            if position_id not in self.active_positions:
+                raise ValidationException(f"持仓不存在: {position_id}")
 
-    async def update_position(
+            position = self.active_positions[position_id]
+
+            # 计算新的平均成本
+            total_quantity = abs(position.quantity) + additional_quantity
+            total_cost = (
+                abs(position.quantity) * position.entry_price
+                + additional_quantity * additional_price
+            )
+
+            if total_quantity > 0:
+                new_average_price = total_cost / total_quantity
+            else:
+                new_average_price = position.entry_price
+
+            # 更新持仓
+            if position.quantity > 0:
+                position.quantity += additional_quantity
+            else:
+                position.quantity -= additional_quantity
+
+            position.entry_price = new_average_price
+            position.last_updated = datetime.now()
+
+            # 记录加仓
+            await self._add_position_snapshot(position, f"position_added_{reason}")
+
+            self.logger.info(
+                f"加仓成功: {position_id} 数量: {additional_quantity} 价格: {additional_price}"
+            )
+
+            return {
+                "position_id": position_id,
+                "added_quantity": float(additional_quantity),
+                "added_price": float(additional_price),
+                "new_total_quantity": float(position.quantity),
+                "new_average_price": float(new_average_price),
+                "updated_at": datetime.now().isoformat(),
+            }
+
+        except Exception as e:
+            self.logger.error(f"加仓失败: {e}")
+            raise ManagementException(f"加仓失败: {e}")
+
+    async def reduce_position(
         self,
         position_id: str,
-        new_size: Optional[float] = None,
-        new_stop_loss: Optional[float] = None,
-        new_take_profit: Optional[float] = None,
-        new_leverage: Optional[float] = None
-    ) -> bool:
-        """更新持仓"""
+        reduce_quantity: Decimal,
+        reduce_price: Decimal,
+        reason: str = "manual_reduction",
+    ) -> Dict[str, Any]:
+        """减仓操作"""
         try:
-            position = self.positions.get(position_id)
-            if not position:
-                return False
-                
-            updated = False
-            
-            if new_size is not None and new_size != position.size:
-                position.size = new_size
-                updated = True
-                
-            if new_stop_loss is not None:
-                position.stop_loss = new_stop_loss
-                updated = True
-                
-            if new_take_profit is not None:
-                position.take_profit = new_take_profit
-                updated = True
-                
-            if new_leverage is not None:
-                position.leverage = new_leverage
-                updated = True
-                
-            if updated:
-                position.updated_at = datetime.utcnow()
-                logger.info(f"持仓已更新: {position_id}")
-                
-            return True
-            
+            if position_id not in self.active_positions:
+                raise ValidationException(f"持仓不存在: {position_id}")
+
+            position = self.active_positions[position_id]
+
+            if reduce_quantity > abs(position.quantity):
+                raise ValidationException("减仓数量不能超过当前持仓数量")
+
+            # 计算减仓盈亏
+            if position.side == "LONG":
+                pnl_per_unit = reduce_price - position.entry_price
+            else:  # SHORT
+                pnl_per_unit = position.entry_price - reduce_price
+
+            realized_pnl = pnl_per_unit * reduce_quantity
+
+            # 更新持仓
+            if position.quantity > 0:
+                position.quantity -= reduce_quantity
+            else:
+                position.quantity += reduce_quantity
+
+            position.last_updated = datetime.now()
+
+            # 记录减仓
+            await self._add_position_snapshot(position, f"position_reduced_{reason}")
+
+            # 如果完全平仓，停止追踪
+            if position.quantity == 0:
+                await self.stop_tracking_position(position_id, reason)
+
+            self.logger.info(
+                f"减仓成功: {position_id} 数量: {reduce_quantity} 盈利: {realized_pnl}"
+            )
+
+            return {
+                "position_id": position_id,
+                "reduced_quantity": float(reduce_quantity),
+                "reduce_price": float(reduce_price),
+                "realized_pnl": float(realized_pnl),
+                "remaining_quantity": float(position.quantity),
+                "updated_at": datetime.now().isoformat(),
+            }
+
         except Exception as e:
-            logger.error(f"更新持仓失败 {position_id}: {e}")
-            return False
+            self.logger.error(f"减仓失败: {e}")
+            raise ManagementException(f"减仓失败: {e}")
 
-    async def add_alert_callback(self, callback: Callable):
-        """添加预警回调"""
-        self.alert_callbacks.append(callback)
-
-    async def get_alerts(
+    async def update_position_parameters(
         self,
-        position_id: Optional[str] = None,
-        unacknowledged_only: bool = False
-    ) -> List[PositionAlert]:
-        """获取预警"""
-        alerts = self.alerts
-        
-        if position_id:
-            alerts = [a for a in alerts if a.position_id == position_id]
-            
-        if unacknowledged_only:
-            alerts = [a for a in alerts if not a.acknowledged]
-            
-        return alerts
+        position_id: str,
+        stop_loss: Optional[Decimal] = None,
+        take_profit: Optional[Decimal] = None,
+        leverage: Optional[Decimal] = None,
+    ) -> Dict[str, Any]:
+        """更新持仓参数"""
+        try:
+            if position_id not in self.active_positions:
+                raise ValidationException(f"持仓不存在: {position_id}")
+
+            position = self.active_positions[position_id]
+            updates = {}
+
+            # 更新止损价
+            if stop_loss is not None:
+                position.stop_loss_price = stop_loss
+                updates["stop_loss_price"] = float(stop_loss)
+
+            # 更新止盈价
+            if take_profit is not None:
+                position.take_profit_price = take_profit
+                updates["take_profit_price"] = float(take_profit)
+
+            # 更新杠杆
+            if leverage is not None and position.position_type == PositionType.FUTURES:
+                if leverage > 0 and leverage <= position.max_leverage:
+                    position.leverage = leverage
+                    # 重新计算保证金
+                    position_value = (
+                        abs(position.quantity)
+                        * position.current_price
+                        * position.contract_value
+                    )
+                    position.margin_used = position_value / leverage
+                    updates["leverage"] = float(leverage)
+                    updates["margin_used"] = float(position.margin_used)
+                else:
+                    raise ValidationException(f"杠杆设置无效: {leverage}")
+
+            position.last_updated = datetime.now()
+
+            # 添加参数更新记录
+            await self._add_position_snapshot(position, "parameters_updated")
+
+            self.logger.info(f"更新持仓参数成功: {position_id} {updates}")
+
+            return {
+                "position_id": position_id,
+                "updates": updates,
+                "updated_at": datetime.now().isoformat(),
+            }
+
+        except Exception as e:
+            self.logger.error(f"更新持仓参数失败: {e}")
+            raise ManagementException(f"更新持仓参数失败: {e}")
+
+    async def get_position_alerts(
+        self, position_id: Optional[str] = None, unacknowledged_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        """获取持仓预警"""
+        try:
+            if position_id:
+                alerts = self.position_alerts.get(position_id, [])
+            else:
+                # 获取所有预警
+                alerts = []
+                for alert_list in self.position_alerts.values():
+                    alerts.extend(alert_list)
+
+            # 过滤未确认的预警
+            if unacknowledged_only:
+                alerts = [alert for alert in alerts if not alert.acknowledged]
+
+            # 按时间排序
+            alerts.sort(key=lambda x: x.triggered_at, reverse=True)
+
+            return [alert.to_dict() for alert in alerts]
+
+        except Exception as e:
+            self.logger.error(f"获取持仓预警失败: {e}")
+            return []
 
     async def acknowledge_alert(self, alert_id: str) -> bool:
         """确认预警"""
-        for alert in self.alerts:
-            if alert.id == alert_id:
-                alert.acknowledged = True
-                return True
-        return False
-
-    async def get_position_summary(self) -> Dict[str, Any]:
-        """获取持仓摘要"""
         try:
-            positions = list(self.positions.values())
-            
-            total_positions = len(positions)
-            open_positions = len([p for p in positions if p.status == PositionStatus.OPEN])
-            total_pnl = sum(p.unrealized_pnl for p in positions)
-            total_margin = sum(p.margin_used for p in positions)
-            
-            # 按符号统计
-            symbol_stats = defaultdict(lambda: {"count": 0, "pnl": 0.0, "margin": 0.0})
-            for position in positions:
-                symbol = position.symbol
-                symbol_stats[symbol]["count"] += 1
-                symbol_stats[symbol]["pnl"] += position.unrealized_pnl
-                symbol_stats[symbol]["margin"] += position.margin_used
-            
+            for position_id, alerts in self.position_alerts.items():
+                for alert in alerts:
+                    if alert.id == alert_id:
+                        alert.acknowledged = True
+                        self.logger.info(f"确认预警: {alert_id}")
+                        return True
+            return False
+
+        except Exception as e:
+            self.logger.error(f"确认预警失败: {e}")
+            return False
+
+    async def bulk_update_prices(
+        self, price_updates: Dict[str, Decimal]
+    ) -> Dict[str, Any]:
+        """批量更新价格"""
+        try:
+            successful_updates = 0
+            failed_updates = []
+
+            for symbol, new_price in price_updates.items():
+                try:
+                    # 找到所有相关持仓
+                    symbol_positions = [
+                        (pos_id, pos)
+                        for pos_id, pos in self.active_positions.items()
+                        if pos.symbol == symbol
+                    ]
+
+                    for position_id, position in symbol_positions:
+                        await self.update_position_price(
+                            position_id, new_price, "bulk_update"
+                        )
+
+                    successful_updates += len(symbol_positions)
+
+                except Exception as e:
+                    failed_updates.append({"symbol": symbol, "error": str(e)})
+
             return {
-                "timestamp": datetime.utcnow(),
-                "total_positions": total_positions,
-                "open_positions": open_positions,
-                "total_unrealized_pnl": total_pnl,
-                "total_margin_used": total_margin,
-                "symbol_breakdown": dict(symbol_stats),
-                "unacknowledged_alerts": len([a for a in self.alerts if not a.acknowledged])
+                "total_symbols": len(price_updates),
+                "successful_updates": successful_updates,
+                "failed_updates": failed_updates,
+                "processed_at": datetime.now().isoformat(),
             }
-            
+
         except Exception as e:
-            logger.error(f"获取持仓摘要失败: {e}")
-            return {"error": str(e)}
+            self.logger.error(f"批量更新价格失败: {e}")
+            raise ManagementException(f"批量更新价格失败: {e}")
 
+    async def _add_position_snapshot(
+        self, position: Position, action: str
+    ) -> Dict[str, Any]:
+        """添加持仓快照"""
+        snapshot = {
+            "position_id": position.position_id,
+            "action": action,
+            "timestamp": datetime.now().isoformat(),
+            "symbol": position.symbol,
+            "quantity": float(position.quantity),
+            "entry_price": float(position.entry_price),
+            "current_price": float(position.current_price),
+            "unrealized_pnl": float(position.unrealized_pnl),
+            "realized_pnl": float(position.realized_pnl),
+            "total_pnl": float(position.unrealized_pnl + position.realized_pnl),
+            "margin_used": float(position.margin_used),
+            "side": position.side,
+        }
 
-class PositionManager:
-    """持仓管理器 - 高级接口"""
+        # 添加到历史记录
+        if position.position_id not in self.position_history:
+            self.position_history[position.position_id] = []
 
-    def __init__(self):
-        self.tracking_service = PositionTrackingService()
-        self.executed_orders: Dict[str, Order] = {}
-        
-        logger.info("持仓管理器初始化完成")
+        self.position_history[position.position_id].append(snapshot)
 
-    async def start(self):
-        """启动持仓管理器"""
-        await self.tracking_service.start_tracking()
-        logger.info("持仓管理器已启动")
+        # 保持历史记录在合理范围内
+        if len(self.position_history[position.position_id]) > 1000:
+            self.position_history[position.position_id] = self.position_history[
+                position.position_id
+            ][-500:]
 
-    async def stop(self):
-        """停止持仓管理器"""
-        await self.tracking_service.stop_tracking()
-        logger.info("持仓管理器已停止")
+        return snapshot
 
-    # 高级持仓操作
-    
-    async def create_tracked_position(
-        self,
-        symbol: str,
-        side: str,
-        size: float,
-        entry_price: float,
-        leverage: float = 1.0,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        order_id: Optional[str] = None
-    ) -> str:
-        """创建并追踪持仓"""
-        try:
-            # 计算保证金
-            margin_used = abs(size * entry_price / leverage)
-            
-            position_id = await self.tracking_service.add_position(
-                symbol=symbol,
-                side=side,
-                size=size,
-                entry_price=entry_price,
-                leverage=leverage,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                margin_used=margin_used,
-                metadata={"order_id": order_id} if order_id else {}
+    async def _setup_position_alerts(
+        self, position: Position, config: Dict[str, Any]
+    ) -> List[PositionAlert]:
+        """设置持仓预警"""
+        alerts = []
+
+        # 强平距离预警
+        if config.get("enable_liquidation_alert", True):
+            alert = PositionAlert(
+                position.position_id,
+                PositionAlertType.LIQUIDATION_RISK,
+                "持仓接近强平价格",
+                "high",
             )
-            
-            logger.info(f"创建追踪持仓: {position_id}")
-            return position_id
-            
-        except Exception as e:
-            logger.error(f"创建追踪持仓失败: {e}")
-            raise
+            alerts.append(alert)
 
-    async def execute_position_action(
-        self,
-        position_id: str,
-        action: PositionAction,
-        size: Optional[float] = None,
-        price: Optional[float] = None,
-        reason: str = "manual"
-    ) -> bool:
-        """执行持仓操作"""
-        try:
-            position = await self.tracking_service.get_position(position_id)
-            if not position:
-                return False
-                
-            if action == PositionAction.CLOSE:
-                close_price = price or await self.tracking_service._get_current_price(position.symbol)
-                return await self.tracking_service.close_position(
-                    position_id, close_price, reason
+        # 止盈止损预警
+        if config.get("enable_profit_alert", True) and position.take_profit_price:
+            alert = PositionAlert(
+                position.position_id,
+                PositionAlertType.PROFIT_TARGET,
+                "持仓达到止盈目标",
+                "medium",
+            )
+            alerts.append(alert)
+
+        if config.get("enable_stop_loss_alert", True) and position.stop_loss_price:
+            alert = PositionAlert(
+                position.position_id,
+                PositionAlertType.STOP_LOSS,
+                "持仓触发止损",
+                "high",
+            )
+            alerts.append(alert)
+
+        # 价格预警
+        if "price_alerts" in config:
+            for price_alert in config["price_alerts"]:
+                alert = PositionAlert(
+                    position.position_id,
+                    PositionAlertType.PRICE_ALERT,
+                    f"价格达到 {price_alert['price']}",
+                    price_alert.get("severity", "medium"),
                 )
-                
-            elif action == PositionAction.ADD and size:
-                new_size = position.size + size
-                return await self.tracking_service.update_position(
-                    position_id, new_size=new_size
-                )
-                
-            elif action == PositionAction.REDUCE and size:
-                new_size = position.size - size
-                if abs(new_size) < 0.001:  # 小于最小单位则平仓
-                    return await self.tracking_service.close_position(
-                        position_id, price, reason
+                alerts.append(alert)
+
+        # 保存预警设置
+        if position.position_id not in self.position_alerts:
+            self.position_alerts[position.position_id] = []
+
+        self.position_alerts[position.position_id].extend(alerts)
+
+        return alerts
+
+    async def _check_position_alerts(self, position: Position) -> List[PositionAlert]:
+        """检查持仓预警"""
+        alerts = []
+
+        if position.position_id not in self.position_alerts:
+            return alerts
+
+        position_alerts = self.position_alerts[position.position_id]
+
+        for alert in position_alerts:
+            if alert.acknowledged:
+                continue
+
+            triggered = False
+            message = ""
+
+            if alert.alert_type == PositionAlertType.LIQUIDATION_RISK:
+                risk_assessment = position.get_risk_assessment()
+                if risk_assessment["margin_level"] < 1.2:  # 120%以下为高风险
+                    triggered = True
+                    message = f"保证金水平过低: {risk_assessment['margin_level']:.2f}"
+
+            elif alert.alert_type == PositionAlertType.PROFIT_TARGET:
+                if position.take_profit_price and (
+                    (
+                        position.side == "LONG"
+                        and position.current_price >= position.take_profit_price
                     )
-                else:
-                    return await self.tracking_service.update_position(
-                        position_id, new_size=new_size
+                    or (
+                        position.side == "SHORT"
+                        and position.current_price <= position.take_profit_price
                     )
-                    
-            elif action == PositionAction.ADJUST:
-                return await self.tracking_service.update_position(
-                    position_id,
-                    new_stop_loss=price if price else position.stop_loss
-                )
-                
-            return False
-            
-        except Exception as e:
-            logger.error(f"执行持仓操作失败 {position_id}: {e}")
-            return False
+                ):
+                    triggered = True
+                    message = f"达到止盈价格: {position.take_profit_price}"
 
-    async def get_portfolio_overview(self) -> Dict[str, Any]:
-        """获取投资组合总览"""
-        try:
-            summary = await self.tracking_service.get_position_summary()
-            
-            # 添加风险指标
-            positions = await self.tracking_service.get_positions(PositionStatus.OPEN)
-            
-            if positions:
-                total_exposure = sum(abs(p.size * p.entry_price) for p in positions)
-                total_leverage = total_exposure / max(sum(p.margin_used for p in positions), 1)
-                largest_position = max(positions, key=lambda p: abs(p.size * p.entry_price))
-                
-                summary.update({
-                    "total_exposure": total_exposure,
-                    "average_leverage": total_leverage,
-                    "largest_position": {
-                        "symbol": largest_position.symbol,
-                        "size": largest_position.size,
-                        "value": abs(largest_position.size * largest_position.entry_price)
-                    },
-                    "risk_distribution": await self._calculate_risk_distribution(positions)
-                })
-            
-            return summary
-            
-        except Exception as e:
-            logger.error(f"获取投资组合总览失败: {e}")
-            return {"error": str(e)}
+            elif alert.alert_type == PositionAlertType.STOP_LOSS:
+                if position.stop_loss_price and (
+                    (
+                        position.side == "LONG"
+                        and position.current_price <= position.stop_loss_price
+                    )
+                    or (
+                        position.side == "SHORT"
+                        and position.current_price >= position.stop_loss_price
+                    )
+                ):
+                    triggered = True
+                    message = f"触发止损价格: {position.stop_loss_price}"
 
-    async def _calculate_risk_distribution(self, positions: List[Position]) -> Dict[str, float]:
-        """计算风险分布"""
-        try:
-            total_exposure = sum(abs(p.size * p.entry_price) for p in positions)
-            
-            if total_exposure == 0:
-                return {}
-                
-            distribution = {}
-            for position in positions:
-                position_exposure = abs(position.size * position.entry_price)
-                percentage = (position_exposure / total_exposure) * 100
-                distribution[position.symbol] = percentage
-                
-            return distribution
-            
-        except Exception as e:
-            logger.error(f"计算风险分布失败: {e}")
-            return {}
+            if triggered:
+                alert.message = message
+                alert.triggered_at = datetime.now()
+                alerts.append(alert)
 
+        return alerts
 
-# 全局持仓管理器实例
-_position_manager: Optional[PositionManager] = None
+    async def _check_and_trigger_alerts(self, position: Position):
+        """检查并触发预警"""
+        alerts = await self._check_position_alerts(position)
 
-
-async def get_position_manager() -> PositionManager:
-    """获取全局持仓管理器实例"""
-    global _position_manager
-
-    if _position_manager is None:
-        _position_manager = PositionManager()
-
-    return _position_manager
-
-
-async def shutdown_position_manager():
-    """关闭持仓管理器"""
-    global _position_manager
-
-    if _position_manager:
-        await _position_manager.stop()
-        _position_manager = None
+        for alert in alerts:
+            self.logger.warning(
+                f"持仓预警触发: {position.position_id} "
+                f"{alert.alert_type.value} - {alert.message}"
+            )
